@@ -128,7 +128,7 @@ def gen_merge_proposal_nags(lp, policy, project):
         # Nag about aging merge requests
         if (now - proposal.date_review_requested).days > policy.max_review_age:
             yield Nag(
-                person='everyone',
+                person='Someone',
                 action="review the merge request",
                 subject=proposal.web_link,
                 sort_class=SORT_CLASS_MERGE,
