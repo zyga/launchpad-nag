@@ -1,0 +1,210 @@
+#!/usr/bin/env python
+# Copyright 2012 Canonical Ltd.
+# Written by:
+#   Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 3,
+# as published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""
+Launchpad Nag, the script that nags you to do important things daily.
+
+If you manage, or participate in a project hosted on Launchpad you may find
+this script particularly useful. It monitors the projects you specify and nags
+you to do certain actions according to the policy you can define.
+
+The set of supported features includes things like:
+
+    * Nagging about aging merge requests that have no reviews
+    * Nagging about aging bugs in "New" state
+    * Nagging about bugs that have been in non-"New" state for an extended
+      period of time
+    * Nagging about aging unanswered questions on launchpad answers
+    * Nagging about accepted merge proposals that have not been merged yet 
+"""
+
+from __future__ import unicode_literals, print_function
+
+import argparse
+import collections
+import datetime
+import logging
+
+from launchpadlib.launchpad import Launchpad
+
+
+consumer_name = 'Canonical Hardware Certification Nagging Scripts'
+
+
+# Nag:
+# Indication that we want to nag the 'person'...
+# ...with the specified 'action'
+# ...about a particular 'subject'
+Nag = collections.namedtuple(
+    "Nag", "person action subject sort_class sort_priority sort_age")
+
+SORT_CLASS_BUG, SORT_CLASS_MERGE = range(2)
+
+
+def show_lp_object(obj):
+    print(obj)
+    print("attributes:", obj.lp_attributes)
+    for attr in obj.lp_attributes:
+        print("attribute[%s]: %s" % (attr, getattr(obj, attr)))
+    print("entries:", obj.lp_entries)
+    for entry in obj.lp_entries:
+        print("entry[%s]: %s" % (entry, getattr(obj, entry)))
+    print("collections:", obj.lp_collections)
+    print("operations:", obj.lp_operations)
+    print("-" * 80)
+
+
+class DefaultPolicy:
+
+    mps_need_commit_message = True
+
+    max_review_age = 7
+
+    max_bug_new_age = 7
+
+
+class UTC(datetime.tzinfo):
+
+    def dst(self, foo):
+        return datetime.timedelta(0, 0)
+
+    def utcoffset(self, foo):
+        return datetime.timedelta(0, 0)
+
+
+UTC = UTC()
+
+
+def gen_project_nags(lp, policy, project_name):
+    # TODO: Detect project groups and redirect the nag to all projects
+    # underneath that project
+    # Access the project that we care about
+    logging.debug("Accessing project %r", project_name)
+    project = lp.projects[project_name]
+    # Re-yield all the merge proposal nags
+    # NOTE: change to yield from in py3k3
+    for nag in gen_merge_proposal_nags(lp, policy, project):
+        yield nag
+
+
+def gen_merge_proposal_nags(lp, policy, project):
+    # XXX: cannnot use utcnow as launchpad returns tz-aware objects here
+    now = datetime.datetime.now(tz=UTC)
+    logging.debug("Looking for merge proposals in project %r", project)
+    # NOTE: Workaround for project.getMergeProposals() crashing on timeouts
+    merge_proposals = project.development_focus.branch.landing_candidates
+    for proposal in merge_proposals:
+        logging.debug("Looking at merge proposal %r", proposal)
+        # Skip everything that is still not requested for review
+        if proposal.date_review_requested is None:
+            continue
+        # Skip everything that is already merged
+        if proposal.date_merged is not None:
+            continue
+        # Nag about missing commit message on merge requests
+        if policy.mps_need_commit_message and proposal.commit_message is None:
+            yield Nag(
+                person=proposal.registrant.display_name,
+                action="set a commit message on merge request",
+                subject=proposal.web_link,
+                sort_class=SORT_CLASS_MERGE,
+                sort_priority=None,  # TODO: get from max(linked bugs)
+                sort_age=None  # TODO: get from merge age
+            )
+        # Nag about aging merge requests
+        if (now - proposal.date_review_requested).days > policy.max_review_age:
+            yield Nag(
+                person='everyone',
+                action="review the merge request",
+                subject=proposal.web_link,
+                sort_class=SORT_CLASS_MERGE,
+                sort_priority=None,  # TODO: get from max(linked bugs)
+                sort_age=None  # TODO: get from merge age
+            )
+
+
+def gen_bug_nags(lp, policy, project):
+    now = datetime.datetime.now(tz=UTC)
+    new_threshold = now - datetime.timedelta(days=policy.max_bug_new_age)
+    # Nag about bugs that are "New" for too long
+    logging.debug("Looking at 'new' bugs that are 8 days or older")
+    aging_new_bugs = project.searchTasks(status='New',
+                                         created_before=new_threshold)
+    for bug_task in aging_new_bugs:
+        yield Nag(
+            person='everyone',
+            action='triage the bug',
+            subject=bug_task.web_link,
+            sort_class=SORT_CLASS_BUG,
+            sort_priority=None,  # TODO: convert from importance name
+            sort_age=None)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    group = parser.add_argument_group(title="debugging")
+    group.add_argument(
+        "-d", "--debug", action="store_true", help="Enable debug messages")
+    group = parser.add_argument_group(title="launchpad.net configuration")
+    group.add_argument(
+        '-p', '--project', nargs="+", default=[], required=True,
+        help="Names of Launchpad projects to track")
+    group.add_argument(
+        '--anonymous', action='store_true',
+        help="Access Launchpad anonymously")
+    group.add_argument(
+        '--authenticated', action='store_false', dest='anonymous',
+        help="Access launchpad as youself")
+    group.add_argument(
+        '--staging', action='store_const', const='staging',
+        dest='service_root', help="Use staging launchpad instance")
+    group.add_argument(
+        '--production', action='store_const', const='production',
+        dest='service_root', help="Use production launchpad instance")
+    parser.set_defaults(anonymous=True, service_root='production')
+    args = parser.parse_args()
+    # Get the policy
+    policy = DefaultPolicy
+    # Reconfigure logging
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+    # Access Lauchpad object as the current (system) user or anonymously
+    if args.anonymous:
+        lp = Launchpad.login_anonymously(consumer_name, args.service_root)
+    else:
+        lp = Launchpad.login_with(consumer_name, args.service_root)
+    # Find things to nag about
+    nags = []
+    for project_name in args.project:
+        logging.info("Looking for things to nag about under %s", project_name)
+        nags.extend(gen_project_nags(lp, policy, project_name))
+    nags.sort(key=lambda nag: (nag.sort_class, nag.sort_priority,
+                                    nag.sort_age))
+    print("=" * 80)
+    print("Done thinking, here's the nag list".center(80))
+    print("=" * 80)
+    for index1, nag in enumerate(nags, 1):
+        print("{index1:-2}: [age {age}] {person} should {action} {subject}".format(
+            index1=index1, age=nag.sort_age, person=nag.person,
+            action=nag.action, subject=nag.subject))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
